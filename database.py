@@ -156,6 +156,7 @@ def init_db():
         phone VARCHAR(255),
         address VARCHAR(255),
         role VARCHAR(255),
+        avatar_url VARCHAR(500) NULL,
         
         baptism_received INTEGER DEFAULT 0,
         baptism_date VARCHAR(50),
@@ -187,7 +188,8 @@ def init_db():
         id INT AUTO_INCREMENT PRIMARY KEY,
         username VARCHAR(255) UNIQUE NOT NULL,
         password_hash VARCHAR(255) NOT NULL,
-        role VARCHAR(255) DEFAULT 'Admin'
+        role VARCHAR(255) DEFAULT 'Admin',
+        avatar_url VARCHAR(500) NULL
     );
     """)
 
@@ -208,6 +210,19 @@ def init_db():
     );
     """)
     conn.commit()
+
+    # Alter tables safe check to add columns if they do not exist
+    try:
+        cursor.execute("ALTER TABLE members ADD COLUMN avatar_url VARCHAR(500) NULL")
+        conn.commit()
+    except Exception:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN avatar_url VARCHAR(500) NULL")
+        conn.commit()
+    except Exception:
+        pass
 
     # Seed data if empty
     cursor.execute("SELECT COUNT(*) FROM dioceses")
@@ -453,7 +468,7 @@ if __name__ == "__main__":
 # --- CRUD helper functions ---
 
 # Users / Authentication
-def db_create_user(username, password, role="Admin"):
+def db_create_user(username, password, role="Admin", avatar_url=None):
     conn = get_db_connection()
     row = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
     if row:
@@ -461,9 +476,9 @@ def db_create_user(username, password, role="Admin"):
         raise Exception("Username already exists")
     
     cursor = conn.execute("""
-    INSERT INTO users (username, password_hash, role)
-    VALUES (?, ?, ?)
-    """, (username, hash_password(password), role))
+    INSERT INTO users (username, password_hash, role, avatar_url)
+    VALUES (?, ?, ?, ?)
+    """, (username, hash_password(password), role, avatar_url))
     conn.commit()
     u_id = cursor.lastrowid
     conn.close()
@@ -481,7 +496,7 @@ def db_authenticate_user(username, password):
 
 def db_get_users():
     conn = get_db_connection()
-    rows = conn.execute("SELECT id, username, role FROM users").fetchall()
+    rows = conn.execute("SELECT id, username, role, avatar_url FROM users").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -695,16 +710,16 @@ def db_create_member(data):
     conn = get_db_connection()
     cursor = conn.execute("""
     INSERT INTO members (
-        parish_id, first_name, last_name, gender, dob, email, phone, address, role,
+        parish_id, first_name, last_name, gender, dob, email, phone, address, role, avatar_url,
         baptism_received, baptism_date, baptism_parish,
         communion_received, communion_date, communion_parish,
         confirmation_received, confirmation_date, confirmation_parish,
         marriage_received, marriage_date, marriage_parish,
         holy_orders_received, holy_orders_date, holy_orders_parish
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data["parish_id"], data["first_name"], data["last_name"], data.get("gender"), data.get("dob"),
-        data.get("email"), data.get("phone"), data.get("address"), data.get("role", "Laity"),
+        data.get("email"), data.get("phone"), data.get("address"), data.get("role", "Laity"), data.get("avatar_url"),
         1 if data.get("baptism_received") else 0, data.get("baptism_date"), data.get("baptism_parish"),
         1 if data.get("communion_received") else 0, data.get("communion_date"), data.get("communion_parish"),
         1 if data.get("confirmation_received") else 0, data.get("confirmation_date"), data.get("confirmation_parish"),
@@ -720,7 +735,7 @@ def db_update_member(member_id, data):
     conn = get_db_connection()
     conn.execute("""
     UPDATE members SET 
-        first_name = ?, last_name = ?, gender = ?, dob = ?, email = ?, phone = ?, address = ?, role = ?,
+        first_name = ?, last_name = ?, gender = ?, dob = ?, email = ?, phone = ?, address = ?, role = ?, avatar_url = ?,
         baptism_received = ?, baptism_date = ?, baptism_parish = ?,
         communion_received = ?, communion_date = ?, communion_parish = ?,
         confirmation_received = ?, confirmation_date = ?, confirmation_parish = ?,
@@ -729,7 +744,7 @@ def db_update_member(member_id, data):
     WHERE id = ?
     """, (
         data["first_name"], data["last_name"], data.get("gender"), data.get("dob"),
-        data.get("email"), data.get("phone"), data.get("address"), data.get("role", "Laity"),
+        data.get("email"), data.get("phone"), data.get("address"), data.get("role", "Laity"), data.get("avatar_url"),
         1 if data.get("baptism_received") else 0, data.get("baptism_date"), data.get("baptism_parish"),
         1 if data.get("communion_received") else 0, data.get("communion_date"), data.get("communion_parish"),
         1 if data.get("confirmation_received") else 0, data.get("confirmation_date"), data.get("confirmation_parish"),

@@ -86,6 +86,7 @@ class MemberModel(BaseModel):
     phone: Optional[str] = ""
     address: Optional[str] = ""
     role: Optional[str] = "Laity"
+    avatar_url: Optional[str] = None
     
     # Sacraments
     baptism_received: Optional[bool] = False
@@ -112,6 +113,7 @@ class UserRegisterModel(BaseModel):
     username: str
     password: str
     role: Optional[str] = "Admin"
+    avatar_url: Optional[str] = None
 
 class UserLoginModel(BaseModel):
     username: str
@@ -365,7 +367,7 @@ def delete_member(member_id: int, current_user: dict = Depends(check_permission(
 @app.post("/api/auth/register")
 def register_user(user: UserRegisterModel, current_user: dict = Depends(require_admin)):
     try:
-        u_id = db_create_user(user.username, user.password, user.role)
+        u_id = db_create_user(user.username, user.password, user.role, user.avatar_url)
         return {"id": u_id, "username": user.username, "role": user.role, "message": "User created successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
