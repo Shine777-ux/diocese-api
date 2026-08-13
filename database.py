@@ -271,9 +271,84 @@ def init_db():
     """)
     conn.commit()
 
+    # 7. Wards Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS wards (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        parish_id INT NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE CASCADE
+    );
+    """)
+
+    # 8. Groups Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS `groups` (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        parish_id INT NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE CASCADE
+    );
+    """)
+
+    # 9. Member Groups Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS member_groups (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        member_id INT NOT NULL,
+        group_id INT NOT NULL,
+        role VARCHAR(255) NOT NULL DEFAULT 'Member',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE,
+        FOREIGN KEY (group_id) REFERENCES `groups`(id) ON DELETE CASCADE
+    );
+    """)
+
+    # 10. Families Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS families (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        parish_id INT NOT NULL,
+        ward_id INT,
+        name VARCHAR(255) NOT NULL,
+        address TEXT,
+        phone VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE CASCADE,
+        FOREIGN KEY (ward_id) REFERENCES wards(id) ON DELETE SET NULL
+    );
+    """)
+
+    # 11. Family Relations Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS family_relations (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        family1_id INT NOT NULL,
+        family2_id INT NOT NULL,
+        member_id INT,
+        relationship_type VARCHAR(255) NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (family1_id) REFERENCES families(id) ON DELETE CASCADE,
+        FOREIGN KEY (family2_id) REFERENCES families(id) ON DELETE CASCADE,
+        FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
+    );
+    """)
+    conn.commit()
+
     # Alter tables safe check to add columns if they do not exist
     try:
         cursor.execute("ALTER TABLE members ADD COLUMN avatar_url VARCHAR(500) NULL")
+        conn.commit()
+    except Exception:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE members ADD COLUMN family_id INT NULL")
         conn.commit()
     except Exception:
         pass
@@ -708,7 +783,7 @@ def db_delete_parish(parish_id):
     return True
 
 # Members
-def db_get_members(parish_id=None, role=None, search=None, baptism=None, communion=None, confirmation=None, marriage=None, holy_orders=None):
+def db_get_members(parish_id=None, family_id=None, role=None, search=None, baptism=None, communion=None, confirmation=None, marriage=None, holy_orders=None):
     conn = get_db_connection()
     query = """
         SELECT m.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name
@@ -723,6 +798,9 @@ def db_get_members(parish_id=None, role=None, search=None, baptism=None, communi
     if parish_id:
         conditions.append("m.parish_id = ?")
         params.append(parish_id)
+    if family_id:
+        conditions.append("m.family_id = ?")
+        params.append(family_id)
     if role:
         conditions.append("m.role = ?")
         params.append(role)
@@ -770,15 +848,15 @@ def db_create_member(data):
     conn = get_db_connection()
     cursor = conn.execute("""
     INSERT INTO members (
-        parish_id, first_name, last_name, gender, dob, email, phone, address, role, avatar_url,
+        parish_id, family_id, first_name, last_name, gender, dob, email, phone, address, role, avatar_url,
         baptism_received, baptism_date, baptism_parish,
         communion_received, communion_date, communion_parish,
         confirmation_received, confirmation_date, confirmation_parish,
         marriage_received, marriage_date, marriage_parish,
         holy_orders_received, holy_orders_date, holy_orders_parish
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        data["parish_id"], data["first_name"], data["last_name"], data.get("gender"), data.get("dob"),
+        data["parish_id"], data.get("family_id"), data["first_name"], data["last_name"], data.get("gender"), data.get("dob"),
         data.get("email"), data.get("phone"), data.get("address"), data.get("role", "Laity"), data.get("avatar_url"),
         1 if data.get("baptism_received") else 0, data.get("baptism_date"), data.get("baptism_parish"),
         1 if data.get("communion_received") else 0, data.get("communion_date"), data.get("communion_parish"),
@@ -795,7 +873,7 @@ def db_update_member(member_id, data):
     conn = get_db_connection()
     conn.execute("""
     UPDATE members SET 
-        first_name = ?, last_name = ?, gender = ?, dob = ?, email = ?, phone = ?, address = ?, role = ?, avatar_url = ?,
+        family_id = ?, first_name = ?, last_name = ?, gender = ?, dob = ?, email = ?, phone = ?, address = ?, role = ?, avatar_url = ?,
         baptism_received = ?, baptism_date = ?, baptism_parish = ?,
         communion_received = ?, communion_date = ?, communion_parish = ?,
         confirmation_received = ?, confirmation_date = ?, confirmation_parish = ?,
@@ -803,7 +881,7 @@ def db_update_member(member_id, data):
         holy_orders_received = ?, holy_orders_date = ?, holy_orders_parish = ?
     WHERE id = ?
     """, (
-        data["first_name"], data["last_name"], data.get("gender"), data.get("dob"),
+        data.get("family_id"), data["first_name"], data["last_name"], data.get("gender"), data.get("dob"),
         data.get("email"), data.get("phone"), data.get("address"), data.get("role", "Laity"), data.get("avatar_url"),
         1 if data.get("baptism_received") else 0, data.get("baptism_date"), data.get("baptism_parish"),
         1 if data.get("communion_received") else 0, data.get("communion_date"), data.get("communion_parish"),
@@ -908,3 +986,211 @@ def db_save_permissions(role: str, perms: list):
         conn.commit()
     finally:
         conn.close()
+
+# --- Wards CRUD ---
+def db_create_ward(ward_data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO wards (parish_id, name, description)
+    VALUES (?, ?, ?)
+    """, (ward_data["parish_id"], ward_data["name"], ward_data.get("description", "")))
+    conn.commit()
+    w_id = cursor.lastrowid
+    conn.close()
+    return w_id
+
+def db_get_wards_by_parish(parish_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM wards WHERE parish_id = ?", (parish_id,))
+    res = cursor.fetchall()
+    conn.close()
+    return res
+
+def db_update_ward(ward_id, ward_data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE wards SET parish_id = ?, name = ?, description = ? WHERE id = ?
+    """, (ward_data["parish_id"], ward_data["name"], ward_data.get("description", ""), ward_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_delete_ward(ward_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM wards WHERE id = ?", (ward_id,))
+    cursor.execute("UPDATE families SET ward_id = NULL WHERE ward_id = ?", (ward_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- Groups CRUD ---
+def db_create_group(group_data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO `groups` (parish_id, name, description)
+    VALUES (?, ?, ?)
+    """, (group_data["parish_id"], group_data["name"], group_data.get("description", "")))
+    conn.commit()
+    g_id = cursor.lastrowid
+    conn.close()
+    return g_id
+
+def db_get_groups_by_parish(parish_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM `groups` WHERE parish_id = ?", (parish_id,))
+    res = cursor.fetchall()
+    conn.close()
+    return res
+
+def db_update_group(group_id, group_data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE `groups` SET parish_id = ?, name = ?, description = ? WHERE id = ?
+    """, (group_data["parish_id"], group_data["name"], group_data.get("description", ""), group_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_delete_group(group_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM `groups` WHERE id = ?", (group_id,))
+    cursor.execute("DELETE FROM member_groups WHERE group_id = ?", (group_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- Member Groups ---
+def db_add_member_group(member_id, group_id, role="Member"):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM member_groups WHERE member_id = ? AND group_id = ?", (member_id, group_id))
+    if cursor.fetchone():
+        conn.close()
+        return None
+    cursor.execute("""
+    INSERT INTO member_groups (member_id, group_id, role)
+    VALUES (?, ?, ?)
+    """, (member_id, group_id, role))
+    conn.commit()
+    mg_id = cursor.lastrowid
+    conn.close()
+    return mg_id
+
+def db_remove_member_group(member_group_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM member_groups WHERE id = ?", (member_group_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- Families CRUD ---
+def db_get_families(parish_id=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if parish_id:
+        cursor.execute("SELECT f.*, w.name as ward_name FROM families f LEFT JOIN wards w ON f.ward_id = w.id WHERE f.parish_id = ?", (parish_id,))
+    else:
+        cursor.execute("SELECT f.*, w.name as ward_name FROM families f LEFT JOIN wards w ON f.ward_id = w.id")
+    res = cursor.fetchall()
+    conn.close()
+    return res
+
+def db_get_family(family_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT f.*, w.name as ward_name FROM families f LEFT JOIN wards w ON f.ward_id = w.id WHERE f.id = ?", (family_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+def db_create_family(family_data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO families (parish_id, ward_id, name, address, phone)
+    VALUES (?, ?, ?, ?, ?)
+    """, (family_data["parish_id"], family_data.get("ward_id"), family_data["name"], family_data.get("address", ""), family_data.get("phone", "")))
+    conn.commit()
+    f_id = cursor.lastrowid
+    conn.close()
+    return f_id
+
+def db_update_family(family_id, family_data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE families 
+    SET parish_id = ?, ward_id = ?, name = ?, address = ?, phone = ?
+    WHERE id = ?
+    """, (family_data["parish_id"], family_data.get("ward_id"), family_data["name"], family_data.get("address", ""), family_data.get("phone", ""), family_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_delete_family(family_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM families WHERE id = ?", (family_id,))
+    cursor.execute("UPDATE members SET family_id = NULL WHERE family_id = ?", (family_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- Family Relations ---
+def db_get_family_relations(family_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT r.*, f1.name as family1_name, f2.name as family2_name, m.first_name, m.last_name 
+    FROM family_relations r
+    JOIN families f1 ON r.family1_id = f1.id
+    JOIN families f2 ON r.family2_id = f2.id
+    LEFT JOIN members m ON r.member_id = m.id
+    WHERE r.family1_id = ? OR r.family2_id = ?
+    """, (family_id, family_id))
+    res = cursor.fetchall()
+    conn.close()
+    return res
+
+def db_get_member_family_relations(member_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    SELECT r.*, f1.name as family1_name, f2.name as family2_name
+    FROM family_relations r
+    JOIN families f1 ON r.family1_id = f1.id
+    JOIN families f2 ON r.family2_id = f2.id
+    WHERE r.member_id = ?
+    """, (member_id,))
+    res = cursor.fetchall()
+    conn.close()
+    return res
+
+def db_add_family_relation(family1_id, family2_id, relationship_type, member_id=None, notes=""):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO family_relations (family1_id, family2_id, member_id, relationship_type, notes)
+    VALUES (?, ?, ?, ?, ?)
+    """, (family1_id, family2_id, member_id, relationship_type, notes))
+    conn.commit()
+    r_id = cursor.lastrowid
+    conn.close()
+    return r_id
+
+def db_delete_family_relation(relation_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM family_relations WHERE id = ?", (relation_id,))
+    conn.commit()
+    conn.close()
+    return True
