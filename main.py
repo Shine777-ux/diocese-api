@@ -68,7 +68,15 @@ from database import (
     db_remove_member_group
 )
 
-app = FastAPI(title="Diocese ERP API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()      # Startup
+    yield
+
+app = FastAPI(
+    title="Diocese ERP API",
+    lifespan=lifespan
+)
 
 # Enable CORS for frontend local development
 app.add_middleware(
@@ -77,20 +85,6 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()      # Startup
-
-    yield
-
-    # Shutdown (if needed)
-
-app = FastAPI(
-    title="Diocese ERP API",
-    lifespan=lifespan
 )
 
 # --- Pydantic Models for Input Validation ---
