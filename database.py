@@ -74,28 +74,39 @@ def get_db():
         conn.close()
 
 def get_db_connection():
+    ssl_config = None
+    if "aivencloud.com" in MYSQL_HOST:
+        ssl_config = {"ssl": {}}
     conn = pymysql.connect(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
         user=MYSQL_USER,
         password=MYSQL_PASSWORD,
         database=MYSQL_DATABASE,
-        cursorclass=pymysql.cursors.DictCursor
+        cursorclass=pymysql.cursors.DictCursor,
+        ssl=ssl_config
     )
     return MySQLConnectionWrapper(conn)
 
 def init_db():
+    ssl_config = None
+    if "aivencloud.com" in MYSQL_HOST:
+        ssl_config = {"ssl": {}}
     # Connect without specifying database to create it if it doesn't exist
-    conn = pymysql.connect(
-        host=MYSQL_HOST,
-        port=MYSQL_PORT,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD
-    )
-    cursor = conn.cursor()
-    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_DATABASE}")
-    conn.commit()
-    conn.close()
+    try:
+        conn = pymysql.connect(
+            host=MYSQL_HOST,
+            port=MYSQL_PORT,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            ssl=ssl_config
+        )
+        cursor = conn.cursor()
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_DATABASE}")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
     # Connect to the specified database to create tables
     conn = get_db_connection()
