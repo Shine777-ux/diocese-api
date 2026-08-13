@@ -2,6 +2,8 @@ import pymysql
 import pymysql.cursors
 import os
 import hashlib
+from queue import Queue, Empty
+import threading
 
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "shine30")
@@ -47,9 +49,66 @@ class CursorWrapper:
         rows = self.cursor.fetchall()
         return [RowWrapper(r) for r in rows] if rows else []
 
+class MySQLConnectionPool:
+    def __init__(self, size=15):
+        self.size = size
+        self.pool = Queue(maxsize=size)
+        self.lock = threading.Lock()
+        
+    def _create_connection(self):
+        ssl_config = None
+        if "aivencloud.com" in MYSQL_HOST:
+            ssl_config = {"ssl": {}}
+        return pymysql.connect(
+            host=MYSQL_HOST,
+            port=MYSQL_PORT,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE,
+            cursorclass=pymysql.cursors.DictCursor,
+            ssl=ssl_config
+        )
+        
+    def get_connection(self):
+        with self.lock:
+            try:
+                conn = self.pool.get_nowait()
+                try:
+                    conn.ping(reconnect=True)
+                    return conn
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return self._create_connection()
+            except Empty:
+                return self._create_connection()
+                
+    def release_connection(self, conn):
+        try:
+            self.pool.put_nowait(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+# Global pool instance
+_global_db_pool = None
+_pool_lock = threading.Lock()
+
+def get_db_pool():
+    global _global_db_pool
+    with _pool_lock:
+        if _global_db_pool is None:
+            _global_db_pool = MySQLConnectionPool(size=15)
+        return _global_db_pool
+
 class MySQLConnectionWrapper:
-    def __init__(self, conn):
+    def __init__(self, conn, pool):
         self.conn = conn
+        self.pool = pool
         
     def execute(self, sql, params=None):
         sql_converted = sql.replace("?", "%s")
@@ -64,7 +123,7 @@ class MySQLConnectionWrapper:
         self.conn.commit()
         
     def close(self):
-        self.conn.close()
+        self.pool.release_connection(self.conn)
 
 def get_db():
     conn = get_db_connection()
@@ -74,19 +133,9 @@ def get_db():
         conn.close()
 
 def get_db_connection():
-    ssl_config = None
-    if "aivencloud.com" in MYSQL_HOST:
-        ssl_config = {"ssl": {}}
-    conn = pymysql.connect(
-        host=MYSQL_HOST,
-        port=MYSQL_PORT,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=MYSQL_DATABASE,
-        cursorclass=pymysql.cursors.DictCursor,
-        ssl=ssl_config
-    )
-    return MySQLConnectionWrapper(conn)
+    pool = get_db_pool()
+    conn = pool.get_connection()
+    return MySQLConnectionWrapper(conn, pool)
 
 def init_db():
     ssl_config = None
