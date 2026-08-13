@@ -1,8 +1,22 @@
 from fastapi import FastAPI, HTTPException, Query, Depends, Header
+from fastapi.concurrency import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 import uuid
+import jwt
+from datetime import datetime, timedelta
+
+SECRET_KEY = "super-secret-key-change-me"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 from database import (
     init_db,
@@ -22,6 +36,11 @@ from database import (
     db_create_parish,
     db_update_parish,
     db_delete_parish,
+    db_get_families,
+    db_get_family,
+    db_create_family,
+    db_update_family,
+    db_delete_family,
     db_get_members,
     db_get_member,
     db_create_member,
@@ -32,7 +51,21 @@ from database import (
     db_get_users,
     get_db_connection,
     db_get_permissions,
-    db_save_permissions
+    db_save_permissions,
+    db_get_family_relations,
+    db_get_member_family_relations,
+    db_add_family_relation,
+    db_delete_family_relation,
+    db_create_ward,
+    db_get_wards_by_parish,
+    db_update_ward,
+    db_delete_ward,
+    db_create_group,
+    db_get_groups_by_parish,
+    db_update_group,
+    db_delete_group,
+    db_add_member_group,
+    db_remove_member_group
 )
 
 app = FastAPI(title="Diocese ERP API")
@@ -46,9 +79,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    init_db()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()      # Startup
+
+    yield
+
+    # Shutdown (if needed)
+
+app = FastAPI(
+    title="Diocese ERP API",
+    lifespan=lifespan
+)
 
 # --- Pydantic Models for Input Validation ---
 
@@ -76,8 +119,38 @@ class ParishModel(BaseModel):
     phone: Optional[str] = ""
     email: Optional[str] = ""
 
+class WardModel(BaseModel):
+    parish_id: int
+    name: str
+    description: Optional[str] = ""
+
+class GroupModel(BaseModel):
+    parish_id: int
+    name: str
+    description: Optional[str] = ""
+
+class MemberGroupModel(BaseModel):
+    group_id: int
+    role: Optional[str] = "Member"
+
+class FamilyModel(BaseModel):
+    parish_id: int
+    ward_id: Optional[int] = None
+    name: str
+    address: Optional[str] = ""
+    phone: Optional[str] = ""
+
+class FamilyRelationModel(BaseModel):
+    family1_id: int
+    family2_id: int
+    member_id: Optional[int] = None
+    relationship_type: str
+    notes: Optional[str] = ""
+    transfer_member: Optional[bool] = False
+
 class MemberModel(BaseModel):
     parish_id: int
+    family_id: Optional[int] = None
     first_name: str
     last_name: str
     gender: Optional[str] = "Male"
@@ -126,11 +199,18 @@ def get_current_user(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Missing or invalid authentication token")
     
     token = authorization.split(" ")[1]
-    parts = token.split("-")
-    if len(parts) < 4:
-        raise HTTPException(status_code=401, detail="Malformed authentication token")
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
         
-    username = parts[3]
+    username = payload.get("sub")
     conn = get_db_connection()
     user = conn.execute("SELECT id, username, role FROM users WHERE username = ?", (username,)).fetchone()
     conn.close()
@@ -202,6 +282,7 @@ def get_stats(current_user: dict = Depends(get_current_user)):
         return db_get_stats()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # Dioceses CRUD
 @app.get("/api/dioceses")
@@ -283,6 +364,8 @@ def get_parish(parish_id: int, current_user: dict = Depends(check_permission("Pa
     res = db_get_parish(parish_id)
     if not res:
         raise HTTPException(status_code=404, detail="Parish not found")
+    res["wards"] = db_get_wards_by_parish(parish_id)
+    res["groups"] = db_get_groups_by_parish(parish_id)
     return res
 
 @app.post("/api/parishes")
@@ -311,10 +394,121 @@ def delete_parish(parish_id: int, current_user: dict = Depends(check_permission(
     db_delete_parish(parish_id)
     return {"message": "Parish deleted successfully"}
 
+# Wards CRUD
+@app.get("/api/wards")
+def get_wards(parish_id: int, current_user: dict = Depends(check_permission("Parishes", "view"))):
+    return db_get_wards_by_parish(parish_id)
+
+@app.post("/api/wards")
+def create_ward(ward: WardModel, current_user: dict = Depends(check_permission("Parishes", "create"))):
+    w_id = db_create_ward(ward.dict())
+    return {"id": w_id, "message": "Ward created successfully"}
+
+@app.put("/api/wards/{ward_id}")
+def update_ward(ward_id: int, ward: WardModel, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    db_update_ward(ward_id, ward.dict())
+    return {"message": "Ward updated successfully"}
+
+@app.delete("/api/wards/{ward_id}")
+def delete_ward(ward_id: int, current_user: dict = Depends(check_permission("Parishes", "delete"))):
+    db_delete_ward(ward_id)
+    return {"message": "Ward deleted successfully"}
+
+# Groups CRUD
+@app.get("/api/groups")
+def get_groups(parish_id: int, current_user: dict = Depends(check_permission("Parishes", "view"))):
+    return db_get_groups_by_parish(parish_id)
+
+@app.post("/api/groups")
+def create_group(group: GroupModel, current_user: dict = Depends(check_permission("Parishes", "create"))):
+    g_id = db_create_group(group.dict())
+    return {"id": g_id, "message": "Group created successfully"}
+
+@app.put("/api/groups/{group_id}")
+def update_group(group_id: int, group: GroupModel, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    db_update_group(group_id, group.dict())
+    return {"message": "Group updated successfully"}
+
+@app.delete("/api/groups/{group_id}")
+def delete_group(group_id: int, current_user: dict = Depends(check_permission("Parishes", "delete"))):
+    db_delete_group(group_id)
+    return {"message": "Group deleted successfully"}
+
+# Families CRUD
+@app.get("/api/families")
+def get_families(parish_id: Optional[int] = None, current_user: dict = Depends(check_permission("Parishes", "view"))):
+    return db_get_families(parish_id)
+
+@app.get("/api/families/{family_id}")
+def get_family(family_id: int, current_user: dict = Depends(check_permission("Parishes", "view"))):
+    res = db_get_family(family_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Family not found")
+    # Fetch members of this family
+    members = db_get_members(family_id=family_id)
+    res["members"] = members
+    # Fetch relations of this family
+    relations = db_get_family_relations(family_id)
+    res["relations"] = relations
+    return res
+
+@app.post("/api/families/relations")
+def add_family_relation(relation: FamilyRelationModel, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    data = relation.dict()
+    transfer = data.pop("transfer_member", False)
+    r_id = db_add_family_relation(**data)
+    
+    # Handle member transfer
+    if transfer and relation.member_id:
+        member = db_get_member(relation.member_id)
+        if member:
+            # Move member to the family they are not currently in, typically family2_id
+            new_family_id = relation.family2_id if member["family_id"] == relation.family1_id else relation.family1_id
+            
+            # Make sure we don't overwrite date fields with formatted strings if the db_update expects standard format
+            # db_update_member takes dict, but we should reuse the existing logic
+            # The safest way is to update the DB directly for just this field to avoid validation issues with full update
+            conn = get_db_connection()
+            try:
+                conn.execute("UPDATE members SET family_id = ? WHERE id = ?", (new_family_id, relation.member_id))
+                conn.commit()
+            finally:
+                conn.close()
+
+    return {"id": r_id, "message": "Family relation added successfully"}
+
+@app.delete("/api/families/relations/{relation_id}")
+def delete_family_relation(relation_id: int, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    db_delete_family_relation(relation_id)
+    return {"message": "Family relation deleted successfully"}
+
+
+@app.post("/api/families")
+def create_family(family: FamilyModel, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    f_id = db_create_family(family.dict())
+    return {"id": f_id, "message": "Family created successfully"}
+
+@app.put("/api/families/{family_id}")
+def update_family(family_id: int, family: FamilyModel, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    res = db_get_family(family_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Family not found")
+    db_update_family(family_id, family.dict())
+    return {"message": "Family updated successfully"}
+
+@app.delete("/api/families/{family_id}")
+def delete_family(family_id: int, current_user: dict = Depends(check_permission("Parishes", "delete"))):
+    res = db_get_family(family_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Family not found")
+    db_delete_family(family_id)
+    return {"message": "Family deleted successfully"}
+
 # Members CRUD
 @app.get("/api/members")
 def get_members(
     parish_id: Optional[int] = None,
+    family_id: Optional[int] = None,
     role: Optional[str] = None,
     search: Optional[str] = None,
     baptism: Optional[bool] = None,
@@ -324,13 +518,15 @@ def get_members(
     holy_orders: Optional[bool] = None,
     current_user: dict = Depends(check_permission("Parishioners", "view"))
 ):
-    return db_get_members(parish_id, role, search, baptism, communion, confirmation, marriage, holy_orders)
+    return db_get_members(parish_id, family_id, role, search, baptism, communion, confirmation, marriage, holy_orders)
 
 @app.get("/api/members/{member_id}")
 def get_member(member_id: int, current_user: dict = Depends(check_permission("Parishioners", "view"))):
     res = db_get_member(member_id)
     if not res:
         raise HTTPException(status_code=404, detail="Member not found")
+    relations = db_get_member_family_relations(member_id)
+    res["relations"] = relations
     return res
 
 @app.post("/api/members")
@@ -355,12 +551,25 @@ def update_member(member_id: int, member: MemberModel, current_user: dict = Depe
     return {"message": "Member updated successfully"}
 
 @app.delete("/api/members/{member_id}")
-def delete_member(member_id: int, current_user: dict = Depends(check_permission("Parishioners", "delete"))):
+def delete_member(member_id: int, current_user: dict = Depends(check_permission("Parishes", "delete"))):
     res = db_get_member(member_id)
     if not res:
         raise HTTPException(status_code=404, detail="Member not found")
     db_delete_member(member_id)
     return {"message": "Member deleted successfully"}
+
+# Member Groups Endpoints
+@app.post("/api/members/{member_id}/groups")
+def add_member_to_group(member_id: int, group: MemberGroupModel, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    mg_id = db_add_member_group(member_id, group.group_id, group.role)
+    if not mg_id:
+        raise HTTPException(status_code=400, detail="Member is already in this group")
+    return {"id": mg_id, "message": "Added to group successfully"}
+
+@app.delete("/api/members/groups/{member_group_id}")
+def remove_member_from_group(member_group_id: int, current_user: dict = Depends(check_permission("Parishes", "edit"))):
+    db_remove_member_group(member_group_id)
+    return {"message": "Removed from group successfully"}
 
 # --- Auth Endpoints ---
 
@@ -377,9 +586,11 @@ def login_user(credentials: UserLoginModel):
     user = db_authenticate_user(credentials.username, credentials.password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    # Return user object along with a simple mock token
+        
+    access_token = create_access_token(data={"sub": user["username"]})
+    
     return {
-        "token": f"session-token-{user['id']}-{user['username']}",
+        "token": access_token,
         "user": user,
         "message": "Login successful"
     }
@@ -390,3 +601,7 @@ def get_all_users(current_user: dict = Depends(require_admin)):
         return db_get_users()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
