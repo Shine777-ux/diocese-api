@@ -70,7 +70,12 @@ from database import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()      # Startup
+    try:
+        init_db()
+        print("Database initialized successfully!")
+    except Exception as e:
+        print(f"Warning: Database initialization failed during startup: {e}")
+        print("Please check your database credentials (MYSQL_HOST, MYSQL_PORT, etc.)")
     yield
 
 app = FastAPI(
@@ -86,6 +91,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Diocese ERP API"}
+
+@app.get("/api/health")
+def health_check():
+    db_status = "ok"
+    try:
+        conn = get_db_connection()
+        conn.close()
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    return {"service": "ok", "database": db_status}
 
 # --- Pydantic Models for Input Validation ---
 

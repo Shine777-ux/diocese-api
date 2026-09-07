@@ -66,7 +66,8 @@ class MySQLConnectionPool:
             password=MYSQL_PASSWORD,
             database=MYSQL_DATABASE,
             cursorclass=pymysql.cursors.DictCursor,
-            ssl=ssl_config
+            ssl=ssl_config,
+            connect_timeout=10
         )
         
     def get_connection(self):
@@ -148,7 +149,8 @@ def init_db():
             port=MYSQL_PORT,
             user=MYSQL_USER,
             password=MYSQL_PASSWORD,
-            ssl=ssl_config
+            ssl=ssl_config,
+            connect_timeout=10
         )
         cursor = conn.cursor()
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_DATABASE}")
