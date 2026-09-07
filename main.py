@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, Header
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.concurrency import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -91,6 +92,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    error_msg = str(exc)
+    if "Can't connect to MySQL" in error_msg or "OperationalError" in str(type(exc)):
+        detail = "Database connection failed: The configured MySQL host is unreachable. Please verify your Aiven or MySQL database service and Render environment variables."
+    else:
+        detail = f"Server error: {error_msg}"
+    return JSONResponse(
+        status_code=500,
+        content={"detail": detail},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 @app.get("/")
 def root():
