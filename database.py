@@ -4,6 +4,7 @@ import os
 import hashlib
 from queue import Queue, Empty
 import threading
+import time
 
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "shine30")
@@ -53,7 +54,6 @@ class MySQLConnectionPool:
     def __init__(self, size=15):
         self.size = size
         self.pool = Queue(maxsize=size)
-        self.lock = threading.Lock()
         
     def _create_connection(self):
         ssl_config = None
@@ -71,20 +71,22 @@ class MySQLConnectionPool:
         )
         
     def get_connection(self):
-        with self.lock:
+        # Queue.get_nowait() is atomic and thread-safe without an external lock
+        try:
+            conn = self.pool.get_nowait()
+        except Empty:
+            return self._create_connection()
+
+        # Ping remote DB without holding a global lock so other requests proceed in parallel
+        try:
+            conn.ping(reconnect=True)
+            return conn
+        except Exception:
             try:
-                conn = self.pool.get_nowait()
-                try:
-                    conn.ping(reconnect=True)
-                    return conn
-                except Exception:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    return self._create_connection()
-            except Empty:
-                return self._create_connection()
+                conn.close()
+            except Exception:
+                pass
+            return self._create_connection()
                 
     def release_connection(self, conn):
         try:
@@ -949,16 +951,31 @@ def db_get_stats():
         "recent_members": recent_members
     }
 
+_permissions_cache = {}
+_permissions_cache_ttl = 300  # 5 minutes
+
 def db_get_permissions(role: str = None):
+    cache_key = role.lower() if role else "__all__"
+    now = time.time()
+    if cache_key in _permissions_cache:
+        cached_time, cached_data = _permissions_cache[cache_key]
+        if now - cached_time < _permissions_cache_ttl:
+            return cached_data
+
     conn = get_db_connection()
-    if role:
-        rows = conn.execute("SELECT * FROM role_permissions WHERE role = ?", (role,)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM role_permissions").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        if role:
+            rows = conn.execute("SELECT * FROM role_permissions WHERE role = ?", (role,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM role_permissions").fetchall()
+        result = [dict(r) for r in rows]
+        _permissions_cache[cache_key] = (now, result)
+        return result
+    finally:
+        conn.close()
 
 def db_save_permissions(role: str, perms: list):
+    _permissions_cache.clear()
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -986,6 +1003,35 @@ def db_save_permissions(role: str, perms: list):
                 int(p.get("can_send", 0))
             ))
         conn.commit()
+    finally:
+        conn.close()
+
+def db_get_bootstrap_data():
+    conn = get_db_connection()
+    try:
+        dioceses = [dict(r) for r in conn.execute("SELECT * FROM dioceses").fetchall()]
+        deaneries = [dict(r) for r in conn.execute(
+            "SELECT d.*, o.name as diocese_name FROM deaneries d JOIN dioceses o ON d.diocese_id = o.id"
+        ).fetchall()]
+        parishes = [dict(r) for r in conn.execute(
+            "SELECT p.*, o.name as diocese_name, d.name as deanery_name "
+            "FROM parishes p "
+            "JOIN dioceses o ON p.diocese_id = o.id "
+            "JOIN deaneries d ON p.deanery_id = d.id"
+        ).fetchall()]
+        members = [dict(r) for r in conn.execute(
+            "SELECT m.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name "
+            "FROM members m "
+            "JOIN parishes p ON m.parish_id = p.id "
+            "JOIN deaneries d ON p.deanery_id = d.id "
+            "JOIN dioceses o ON p.diocese_id = o.id"
+        ).fetchall()]
+        return {
+            "dioceses": dioceses,
+            "deaneries": deaneries,
+            "parishes": parishes,
+            "members": members
+        }
     finally:
         conn.close()
 

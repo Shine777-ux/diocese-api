@@ -66,7 +66,8 @@ from database import (
     db_update_group,
     db_delete_group,
     db_add_member_group,
-    db_remove_member_group
+    db_remove_member_group,
+    db_get_bootstrap_data
 )
 
 @asynccontextmanager
@@ -246,6 +247,14 @@ def get_current_user(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Could not validate credentials")
         
     username = payload.get("sub")
+    role = payload.get("role")
+    uid = payload.get("uid")
+
+    # Fast-path: If role and uid are embedded in the validated JWT, avoid remote DB round-trip!
+    if role and uid is not None:
+        return {"id": uid, "username": username, "role": role}
+
+    # Fallback for older tokens without embedded role/uid
     conn = get_db_connection()
     user = conn.execute("SELECT id, username, role FROM users WHERE username = ?", (username,)).fetchone()
     conn.close()
@@ -262,15 +271,13 @@ def check_permission(page: str, action: str):
         if user_role.lower() in ("admin", "administrator"):
             return current_user
             
-        conn = get_db_connection()
+        # Use in-memory cached permissions instead of querying DB on every check
+        perms = db_get_permissions(user_role)
+        target_page = page.lower()
         col = f"can_{action}"
-        row = conn.execute(
-            f"SELECT {col} FROM role_permissions WHERE LOWER(role) = ? AND LOWER(page) = ?",
-            (user_role.lower(), page.lower())
-        ).fetchone()
-        conn.close()
+        row = next((p for p in perms if p.get("page", "").lower() == target_page), None)
         
-        if not row or row[0] != 1:
+        if not row or row.get(col) != 1:
             raise HTTPException(
                 status_code=403, 
                 detail=f"Permission denied. Role '{user_role}' does not have '{action}' permission on page '{page}'."
@@ -315,6 +322,14 @@ def save_role_permissions(payload: UpdatePermissionsModel, current_user: dict = 
 def get_stats(current_user: dict = Depends(get_current_user)):
     try:
         return db_get_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Coordinated Bootstrap Endpoint (dioceses, deaneries, parishes, members in 1 single connection/trip)
+@app.get("/api/bootstrap")
+def get_bootstrap_data_endpoint(current_user: dict = Depends(get_current_user)):
+    try:
+        return db_get_bootstrap_data()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -622,7 +637,11 @@ def login_user(credentials: UserLoginModel):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
         
-    access_token = create_access_token(data={"sub": user["username"]})
+    access_token = create_access_token(data={
+        "sub": user["username"],
+        "role": user.get("role", "Admin"),
+        "uid": user.get("id")
+    })
     
     return {
         "token": access_token,
