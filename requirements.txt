@@ -4,4 +4,7 @@ pymysql
 cryptography
 pyjwt
 python-multipart
+bcrypt
+openpyxl
+reportlab
 

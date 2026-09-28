@@ -5,6 +5,7 @@ import hashlib
 from queue import Queue, Empty
 import threading
 import time
+from datetime import datetime
 
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "shine30")
@@ -13,8 +14,34 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "scd")
 
 def hash_password(password: str) -> str:
+    try:
+        import bcrypt
+        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    except Exception:
+        salt = "diocese_secret_salt"
+        return hashlib.sha256((password + salt).encode('utf-8')).hexdigest()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    if not hashed_password or not plain_password:
+        return False
+    # Bcrypt hash support ($2a$, $2b$, $2y$)
+    if hashed_password.startswith(("$2a$", "$2b$", "$2y$")):
+        try:
+            import bcrypt
+            return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+        except Exception:
+            pass
+    # SHA-256 with salt support
     salt = "diocese_secret_salt"
-    return hashlib.sha256((password + salt).encode('utf-8')).hexdigest()
+    if hashlib.sha256((plain_password + salt).encode('utf-8')).hexdigest() == hashed_password:
+        return True
+    # Plain SHA-256 support
+    if hashlib.sha256(plain_password.encode('utf-8')).hexdigest() == hashed_password:
+        return True
+    # Direct equality fallback
+    if plain_password == hashed_password:
+        return True
+    return False
 
 class RowWrapper(dict):
     def __init__(self, d):
@@ -67,7 +94,8 @@ class MySQLConnectionPool:
             database=MYSQL_DATABASE,
             cursorclass=pymysql.cursors.DictCursor,
             ssl=ssl_config,
-            connect_timeout=10
+            connect_timeout=10,
+            autocommit=True
         )
         
     def get_connection(self):
@@ -89,6 +117,10 @@ class MySQLConnectionPool:
             return self._create_connection()
                 
     def release_connection(self, conn):
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         try:
             self.pool.put_nowait(conn)
         except Exception:
@@ -253,9 +285,23 @@ def init_db():
         username VARCHAR(255) UNIQUE NOT NULL,
         password_hash VARCHAR(255) NOT NULL,
         role VARCHAR(255) DEFAULT 'Admin',
-        avatar_url VARCHAR(500) NULL
+        avatar_url VARCHAR(500) NULL,
+        deanery_id INT NULL,
+        parish_id INT NULL,
+        FOREIGN KEY (deanery_id) REFERENCES deaneries(id) ON DELETE SET NULL,
+        FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE SET NULL
     );
     """)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN deanery_id INT NULL")
+        cursor.execute("ALTER TABLE users ADD CONSTRAINT fk_user_deanery FOREIGN KEY (deanery_id) REFERENCES deaneries(id) ON DELETE SET NULL")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN parish_id INT NULL")
+        cursor.execute("ALTER TABLE users ADD CONSTRAINT fk_user_parish FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE SET NULL")
+    except Exception:
+        pass
 
     # 6. Role Permissions Table
     cursor.execute("""
@@ -339,6 +385,65 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (family1_id) REFERENCES families(id) ON DELETE CASCADE,
         FOREIGN KEY (family2_id) REFERENCES families(id) ON DELETE CASCADE,
+        FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
+    );
+    """)
+
+    # 12. Events & Mass Timings Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS events (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        parish_id INT NULL,
+        diocese_id INT NULL,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        event_type VARCHAR(100) DEFAULT 'Mass',
+        start_time VARCHAR(50) NOT NULL,
+        end_time VARCHAR(50) NULL,
+        location VARCHAR(255) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE CASCADE,
+        FOREIGN KEY (diocese_id) REFERENCES dioceses(id) ON DELETE CASCADE
+    );
+    """)
+
+    # 13. Circulars & Announcements Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS circulars (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        diocese_id INT NULL,
+        deanery_id INT NULL,
+        parish_id INT NULL,
+        title VARCHAR(255) NOT NULL,
+        content TEXT NOT NULL,
+        priority VARCHAR(50) DEFAULT 'Normal',
+        author VARCHAR(255) NULL,
+        publish_date VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (diocese_id) REFERENCES dioceses(id) ON DELETE CASCADE,
+        FOREIGN KEY (deanery_id) REFERENCES deaneries(id) ON DELETE CASCADE,
+        FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE CASCADE
+    );
+    """)
+
+    # 14. Contributions & Tithes Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS contributions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        parish_id INT NOT NULL,
+        family_id INT NULL,
+        member_id INT NULL,
+        category VARCHAR(100) NOT NULL,
+        amount DECIMAL(10, 2) NOT NULL,
+        payment_method VARCHAR(50) DEFAULT 'Cash',
+        reference_no VARCHAR(100) NULL,
+        receipt_no VARCHAR(100) UNIQUE NOT NULL,
+        payment_date VARCHAR(50) NOT NULL,
+        notes TEXT NULL,
+        recorded_by VARCHAR(255) NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (parish_id) REFERENCES parishes(id) ON DELETE CASCADE,
+        FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE SET NULL,
         FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
     );
     """)
@@ -607,7 +712,88 @@ if __name__ == "__main__":
 # --- CRUD helper functions ---
 
 # Users / Authentication
-def db_create_user(username, password, role="Admin", avatar_url=None):
+def get_user_scope(user: dict) -> dict:
+    """
+    Determines data visibility scope based on role:
+    - Administrator / Admin: Diocese/Global wide (all parishes and members)
+    - Bishop: Diocese/Global wide (all parishes and members)
+    - Dean: Particular deanery parishes and their members
+    - Other roles (Parish Priest, Sisters, Lay people, Youth, etc.): Only their own parish members
+    """
+    role = (user.get("role") or "").strip().lower()
+    
+    if role in ("admin", "administrator", "bishop"):
+        return {
+            "is_all": True,
+            "role": user.get("role"),
+            "deanery_id": None,
+            "parish_id": None,
+            "allowed_parish_ids": None
+        }
+        
+    user_id = user.get("id")
+    deanery_id = user.get("deanery_id")
+    parish_id = user.get("parish_id")
+    username = (user.get("username") or "").strip()
+    
+    conn = get_db_connection()
+    try:
+        # 1. Fetch user record if deanery_id or parish_id are missing
+        if user_id and (deanery_id is None or parish_id is None):
+            u_row = conn.execute("SELECT deanery_id, parish_id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if u_row:
+                if deanery_id is None:
+                    deanery_id = u_row.get("deanery_id")
+                if parish_id is None:
+                    parish_id = u_row.get("parish_id")
+                    
+        # 2. Fallback resolution for parish_id if not explicitly set
+        if parish_id is None and username:
+            m_row = conn.execute(
+                "SELECT parish_id FROM members WHERE LOWER(first_name) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1",
+                (username, username)
+            ).fetchone()
+            if m_row and m_row.get("parish_id"):
+                parish_id = m_row.get("parish_id")
+                
+        # 3. If role is Dean:
+        if role == "dean":
+            if deanery_id is None and parish_id is not None:
+                p_row = conn.execute("SELECT deanery_id FROM parishes WHERE id = ?", (parish_id,)).fetchone()
+                if p_row and p_row.get("deanery_id"):
+                    deanery_id = p_row.get("deanery_id")
+                    
+            if deanery_id is None and username:
+                d_row = conn.execute("SELECT id FROM deaneries WHERE LOWER(dean) LIKE LOWER(?) LIMIT 1", (f"%{username}%",)).fetchone()
+                if d_row:
+                    deanery_id = d_row.get("id")
+                    
+            allowed_parish_ids = []
+            if deanery_id is not None:
+                rows = conn.execute("SELECT id FROM parishes WHERE deanery_id = ?", (deanery_id,)).fetchall()
+                allowed_parish_ids = [r["id"] for r in rows]
+                
+            return {
+                "is_all": False,
+                "role": "Dean",
+                "deanery_id": deanery_id,
+                "parish_id": parish_id,
+                "allowed_parish_ids": allowed_parish_ids
+            }
+            
+        # 4. Other roles (Parish Priest, Sisters, Lay people, Youth, etc.)
+        allowed_parish_ids = [parish_id] if parish_id is not None else []
+        return {
+            "is_all": False,
+            "role": user.get("role"),
+            "deanery_id": deanery_id,
+            "parish_id": parish_id,
+            "allowed_parish_ids": allowed_parish_ids
+        }
+    finally:
+        conn.close()
+
+def db_create_user(username, password, role="Admin", avatar_url=None, deanery_id=None, parish_id=None):
     conn = get_db_connection()
     row = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
     if row:
@@ -615,27 +801,61 @@ def db_create_user(username, password, role="Admin", avatar_url=None):
         raise Exception("Username already exists")
     
     cursor = conn.execute("""
-    INSERT INTO users (username, password_hash, role, avatar_url)
-    VALUES (?, ?, ?, ?)
-    """, (username, hash_password(password), role, avatar_url))
+    INSERT INTO users (username, password_hash, role, avatar_url, deanery_id, parish_id)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (username, hash_password(password), role, avatar_url, deanery_id, parish_id))
     conn.commit()
     u_id = cursor.lastrowid
     conn.close()
     return u_id
 
-def db_authenticate_user(username, password):
+def db_update_user(user_id, data):
     conn = get_db_connection()
-    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    updates = []
+    params = []
+    if "role" in data and data["role"] is not None:
+        updates.append("role = ?")
+        params.append(data["role"])
+    if "avatar_url" in data and data["avatar_url"] is not None:
+        updates.append("avatar_url = ?")
+        params.append(data["avatar_url"])
+    if "deanery_id" in data:
+        updates.append("deanery_id = ?")
+        params.append(data["deanery_id"])
+    if "parish_id" in data:
+        updates.append("parish_id = ?")
+        params.append(data["parish_id"])
+    if "password" in data and data["password"]:
+        updates.append("password_hash = ?")
+        params.append(hash_password(data["password"]))
+    if updates:
+        params.append(user_id)
+        conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
     conn.close()
-    if row and row["password_hash"] == hash_password(password):
+    return True
+
+def db_authenticate_user(username, password):
+    if not username or not password:
+        return None
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM users WHERE LOWER(TRIM(username)) = LOWER(?)", (username.strip(),)).fetchone()
+    conn.close()
+    if row and verify_password(password, row["password_hash"]):
         user_dict = dict(row)
-        user_dict.pop("password_hash")
+        user_dict.pop("password_hash", None)
         return user_dict
     return None
 
 def db_get_users():
     conn = get_db_connection()
-    rows = conn.execute("SELECT id, username, role, avatar_url FROM users").fetchall()
+    rows = conn.execute("""
+        SELECT u.id, u.username, u.role, u.avatar_url, u.deanery_id, u.parish_id,
+               d.name as deanery_name, p.name as parish_name
+        FROM users u
+        LEFT JOIN deaneries d ON u.deanery_id = d.id
+        LEFT JOIN parishes p ON u.parish_id = p.id
+    """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -723,16 +943,23 @@ def db_delete_deanery(deanery_id):
     return True
 
 # Parishes
-def db_get_parishes(diocese_id=None, deanery_id=None):
+def db_get_parishes(diocese_id=None, deanery_id=None, allowed_parish_ids=None):
     conn = get_db_connection()
     query = """
         SELECT p.*, o.name as diocese_name, d.name as deanery_name 
         FROM parishes p 
-        JOIN dioceses o ON p.diocese_id = o.id 
-        JOIN deaneries d ON p.deanery_id = d.id
+        LEFT JOIN dioceses o ON p.diocese_id = o.id 
+        LEFT JOIN deaneries d ON p.deanery_id = d.id
     """
     params = []
     conditions = []
+    if allowed_parish_ids is not None:
+        if not allowed_parish_ids:
+            conn.close()
+            return []
+        placeholders = ",".join(["?"] * len(allowed_parish_ids))
+        conditions.append(f"p.id IN ({placeholders})")
+        params.extend(allowed_parish_ids)
     if diocese_id:
         conditions.append("p.diocese_id = ?")
         params.append(diocese_id)
@@ -787,21 +1014,37 @@ def db_delete_parish(parish_id):
     return True
 
 # Members
-def db_get_members(parish_id=None, family_id=None, role=None, search=None, baptism=None, communion=None, confirmation=None, marriage=None, holy_orders=None):
+def db_get_members(parish_id=None, family_id=None, role=None, search=None, baptism=None, communion=None, confirmation=None, marriage=None, holy_orders=None, allowed_parish_ids=None):
     conn = get_db_connection()
     query = """
         SELECT m.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name
         FROM members m
-        JOIN parishes p ON m.parish_id = p.id
-        JOIN deaneries d ON p.deanery_id = d.id
-        JOIN dioceses o ON p.diocese_id = o.id
+        LEFT JOIN parishes p ON m.parish_id = p.id
+        LEFT JOIN deaneries d ON p.deanery_id = d.id
+        LEFT JOIN dioceses o ON p.diocese_id = o.id
     """
     params = []
     conditions = []
     
-    if parish_id:
+    if allowed_parish_ids is not None:
+        if not allowed_parish_ids:
+            conn.close()
+            return []
+        if parish_id:
+            if parish_id in allowed_parish_ids:
+                conditions.append("m.parish_id = ?")
+                params.append(parish_id)
+            else:
+                conn.close()
+                return []
+        else:
+            placeholders = ",".join(["?"] * len(allowed_parish_ids))
+            conditions.append(f"m.parish_id IN ({placeholders})")
+            params.extend(allowed_parish_ids)
+    elif parish_id:
         conditions.append("m.parish_id = ?")
         params.append(parish_id)
+        
     if family_id:
         conditions.append("m.family_id = ?")
         params.append(family_id)
@@ -840,9 +1083,9 @@ def db_get_member(member_id):
     row = conn.execute("""
         SELECT m.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name
         FROM members m
-        JOIN parishes p ON m.parish_id = p.id
-        JOIN deaneries d ON p.deanery_id = d.id
-        JOIN dioceses o ON p.diocese_id = o.id
+        LEFT JOIN parishes p ON m.parish_id = p.id
+        LEFT JOIN deaneries d ON p.deanery_id = d.id
+        LEFT JOIN dioceses o ON p.diocese_id = o.id
         WHERE m.id = ?
     """, (member_id,)).fetchone()
     conn.close()
@@ -877,6 +1120,7 @@ def db_update_member(member_id, data):
     conn = get_db_connection()
     conn.execute("""
     UPDATE members SET 
+        parish_id = COALESCE(?, parish_id),
         family_id = ?, first_name = ?, last_name = ?, gender = ?, dob = ?, email = ?, phone = ?, address = ?, role = ?, avatar_url = ?,
         baptism_received = ?, baptism_date = ?, baptism_parish = ?,
         communion_received = ?, communion_date = ?, communion_parish = ?,
@@ -885,6 +1129,7 @@ def db_update_member(member_id, data):
         holy_orders_received = ?, holy_orders_date = ?, holy_orders_parish = ?
     WHERE id = ?
     """, (
+        data.get("parish_id"),
         data.get("family_id"), data["first_name"], data["last_name"], data.get("gender"), data.get("dob"),
         data.get("email"), data.get("phone"), data.get("address"), data.get("role", "Laity"), data.get("avatar_url"),
         1 if data.get("baptism_received") else 0, data.get("baptism_date"), data.get("baptism_parish"),
@@ -906,50 +1151,101 @@ def db_delete_member(member_id):
     return True
 
 # Stats & Overview
-def db_get_stats():
+def db_get_stats(allowed_parish_ids=None):
     conn = get_db_connection()
-    
-    # Counts
-    dioceses_count = conn.execute("SELECT COUNT(*) FROM dioceses").fetchone()[0]
-    deaneries_count = conn.execute("SELECT COUNT(*) FROM deaneries").fetchone()[0]
-    parishes_count = conn.execute("SELECT COUNT(*) FROM parishes").fetchone()[0]
-    members_count = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
-    
-    # Role distribution
-    role_rows = conn.execute("SELECT role, COUNT(*) as count FROM members GROUP BY role").fetchall()
-    role_dist = {r["role"]: r["count"] for r in role_rows}
-    
-    # Sacrament rates
-    sacraments = {
-        "baptism": conn.execute("SELECT COUNT(*) FROM members WHERE baptism_received = 1").fetchone()[0],
-        "communion": conn.execute("SELECT COUNT(*) FROM members WHERE communion_received = 1").fetchone()[0],
-        "confirmation": conn.execute("SELECT COUNT(*) FROM members WHERE confirmation_received = 1").fetchone()[0],
-        "marriage": conn.execute("SELECT COUNT(*) FROM members WHERE marriage_received = 1").fetchone()[0],
-        "holy_orders": conn.execute("SELECT COUNT(*) FROM members WHERE holy_orders_received = 1").fetchone()[0],
-    }
-    
-    # Recent members
-    recent_rows = conn.execute("""
-        SELECT m.id, m.first_name, m.last_name, m.role, p.name as parish_name 
-        FROM members m 
-        JOIN parishes p ON m.parish_id = p.id 
-        ORDER BY m.id DESC LIMIT 5
-    """).fetchall()
-    recent_members = [dict(r) for r in recent_rows]
-    
-    conn.close()
-    
-    return {
-        "counts": {
-            "dioceses": dioceses_count,
-            "deaneries": deaneries_count,
-            "parishes": parishes_count,
-            "members": members_count
-        },
-        "role_distribution": role_dist,
-        "sacrament_counts": sacraments,
-        "recent_members": recent_members
-    }
+    try:
+        if allowed_parish_ids is not None:
+            if not allowed_parish_ids:
+                return {
+                    "counts": {"dioceses": 0, "deaneries": 0, "parishes": 0, "members": 0},
+                    "role_distribution": {},
+                    "sacrament_counts": {"baptism": 0, "communion": 0, "confirmation": 0, "marriage": 0, "holy_orders": 0},
+                    "recent_members": []
+                }
+            placeholders = ",".join(["?"] * len(allowed_parish_ids))
+            parishes_count = len(allowed_parish_ids)
+            deaneries_count = conn.execute(
+                f"SELECT COUNT(DISTINCT deanery_id) FROM parishes WHERE id IN ({placeholders}) AND deanery_id IS NOT NULL",
+                allowed_parish_ids
+            ).fetchone()[0]
+            dioceses_count = 1
+            members_count = conn.execute(
+                f"SELECT COUNT(*) FROM members WHERE parish_id IN ({placeholders})",
+                allowed_parish_ids
+            ).fetchone()[0]
+            
+            role_rows = conn.execute(
+                f"SELECT role, COUNT(*) as count FROM members WHERE parish_id IN ({placeholders}) GROUP BY role",
+                allowed_parish_ids
+            ).fetchall()
+            role_dist = {r["role"]: r["count"] for r in role_rows}
+            
+            sacraments = {
+                "baptism": conn.execute(f"SELECT COUNT(*) FROM members WHERE baptism_received = 1 AND parish_id IN ({placeholders})", allowed_parish_ids).fetchone()[0],
+                "communion": conn.execute(f"SELECT COUNT(*) FROM members WHERE communion_received = 1 AND parish_id IN ({placeholders})", allowed_parish_ids).fetchone()[0],
+                "confirmation": conn.execute(f"SELECT COUNT(*) FROM members WHERE confirmation_received = 1 AND parish_id IN ({placeholders})", allowed_parish_ids).fetchone()[0],
+                "marriage": conn.execute(f"SELECT COUNT(*) FROM members WHERE marriage_received = 1 AND parish_id IN ({placeholders})", allowed_parish_ids).fetchone()[0],
+                "holy_orders": conn.execute(f"SELECT COUNT(*) FROM members WHERE holy_orders_received = 1 AND parish_id IN ({placeholders})", allowed_parish_ids).fetchone()[0],
+            }
+            
+            recent_rows = conn.execute(f"""
+                SELECT m.id, m.first_name, m.last_name, m.role, p.name as parish_name 
+                FROM members m 
+                LEFT JOIN parishes p ON m.parish_id = p.id 
+                WHERE m.parish_id IN ({placeholders})
+                ORDER BY m.id DESC LIMIT 5
+            """, allowed_parish_ids).fetchall()
+            recent_members = [dict(r) for r in recent_rows]
+            
+            return {
+                "counts": {
+                    "dioceses": dioceses_count,
+                    "deaneries": deaneries_count,
+                    "parishes": parishes_count,
+                    "members": members_count
+                },
+                "role_distribution": role_dist,
+                "sacrament_counts": sacraments,
+                "recent_members": recent_members
+            }
+        else:
+            dioceses_count = conn.execute("SELECT COUNT(*) FROM dioceses").fetchone()[0]
+            deaneries_count = conn.execute("SELECT COUNT(*) FROM deaneries").fetchone()[0]
+            parishes_count = conn.execute("SELECT COUNT(*) FROM parishes").fetchone()[0]
+            members_count = conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+            
+            role_rows = conn.execute("SELECT role, COUNT(*) as count FROM members GROUP BY role").fetchall()
+            role_dist = {r["role"]: r["count"] for r in role_rows}
+            
+            sacraments = {
+                "baptism": conn.execute("SELECT COUNT(*) FROM members WHERE baptism_received = 1").fetchone()[0],
+                "communion": conn.execute("SELECT COUNT(*) FROM members WHERE communion_received = 1").fetchone()[0],
+                "confirmation": conn.execute("SELECT COUNT(*) FROM members WHERE confirmation_received = 1").fetchone()[0],
+                "marriage": conn.execute("SELECT COUNT(*) FROM members WHERE marriage_received = 1").fetchone()[0],
+                "holy_orders": conn.execute("SELECT COUNT(*) FROM members WHERE holy_orders_received = 1").fetchone()[0],
+            }
+            
+            recent_rows = conn.execute("""
+                SELECT m.id, m.first_name, m.last_name, m.role, p.name as parish_name 
+                FROM members m 
+                LEFT JOIN parishes p ON m.parish_id = p.id 
+                ORDER BY m.id DESC LIMIT 5
+            """).fetchall()
+            recent_members = [dict(r) for r in recent_rows]
+            
+            return {
+                "counts": {
+                    "dioceses": dioceses_count,
+                    "deaneries": deaneries_count,
+                    "parishes": parishes_count,
+                    "members": members_count
+                },
+                "role_distribution": role_dist,
+                "sacrament_counts": sacraments,
+                "recent_members": recent_members
+            }
+    finally:
+        conn.close()
 
 _permissions_cache = {}
 _permissions_cache_ttl = 300  # 5 minutes
@@ -1006,26 +1302,61 @@ def db_save_permissions(role: str, perms: list):
     finally:
         conn.close()
 
-def db_get_bootstrap_data():
+def db_get_bootstrap_data(allowed_parish_ids=None, deanery_id=None):
     conn = get_db_connection()
     try:
         dioceses = [dict(r) for r in conn.execute("SELECT * FROM dioceses").fetchall()]
-        deaneries = [dict(r) for r in conn.execute(
-            "SELECT d.*, o.name as diocese_name FROM deaneries d JOIN dioceses o ON d.diocese_id = o.id"
-        ).fetchall()]
-        parishes = [dict(r) for r in conn.execute(
-            "SELECT p.*, o.name as diocese_name, d.name as deanery_name "
-            "FROM parishes p "
-            "JOIN dioceses o ON p.diocese_id = o.id "
-            "JOIN deaneries d ON p.deanery_id = d.id"
-        ).fetchall()]
-        members = [dict(r) for r in conn.execute(
-            "SELECT m.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name "
-            "FROM members m "
-            "JOIN parishes p ON m.parish_id = p.id "
-            "JOIN deaneries d ON p.deanery_id = d.id "
-            "JOIN dioceses o ON p.diocese_id = o.id"
-        ).fetchall()]
+        
+        # Deaneries
+        if deanery_id:
+            deaneries = [dict(r) for r in conn.execute(
+                "SELECT d.*, o.name as diocese_name FROM deaneries d LEFT JOIN dioceses o ON d.diocese_id = o.id WHERE d.id = ?",
+                (deanery_id,)
+            ).fetchall()]
+        elif allowed_parish_ids is not None:
+            if not allowed_parish_ids:
+                deaneries = []
+            else:
+                placeholders = ",".join(["?"] * len(allowed_parish_ids))
+                deaneries = [dict(r) for r in conn.execute(
+                    f"SELECT DISTINCT d.*, o.name as diocese_name FROM deaneries d LEFT JOIN dioceses o ON d.diocese_id = o.id JOIN parishes p ON p.deanery_id = d.id WHERE p.id IN ({placeholders})",
+                    allowed_parish_ids
+                ).fetchall()]
+        else:
+            deaneries = [dict(r) for r in conn.execute(
+                "SELECT d.*, o.name as diocese_name FROM deaneries d LEFT JOIN dioceses o ON d.diocese_id = o.id"
+            ).fetchall()]
+            
+        # Parishes
+        if allowed_parish_ids is not None:
+            if not allowed_parish_ids:
+                parishes = []
+            else:
+                placeholders = ",".join(["?"] * len(allowed_parish_ids))
+                parishes = [dict(r) for r in conn.execute(
+                    f"SELECT p.*, o.name as diocese_name, d.name as deanery_name FROM parishes p LEFT JOIN dioceses o ON p.diocese_id = o.id LEFT JOIN deaneries d ON p.deanery_id = d.id WHERE p.id IN ({placeholders})",
+                    allowed_parish_ids
+                ).fetchall()]
+        else:
+            parishes = [dict(r) for r in conn.execute(
+                "SELECT p.*, o.name as diocese_name, d.name as deanery_name FROM parishes p LEFT JOIN dioceses o ON p.diocese_id = o.id LEFT JOIN deaneries d ON p.deanery_id = d.id"
+            ).fetchall()]
+            
+        # Members
+        if allowed_parish_ids is not None:
+            if not allowed_parish_ids:
+                members = []
+            else:
+                placeholders = ",".join(["?"] * len(allowed_parish_ids))
+                members = [dict(r) for r in conn.execute(
+                    f"SELECT m.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name FROM members m LEFT JOIN parishes p ON m.parish_id = p.id LEFT JOIN deaneries d ON p.deanery_id = d.id LEFT JOIN dioceses o ON p.diocese_id = o.id WHERE m.parish_id IN ({placeholders})",
+                    allowed_parish_ids
+                ).fetchall()]
+        else:
+            members = [dict(r) for r in conn.execute(
+                "SELECT m.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name FROM members m LEFT JOIN parishes p ON m.parish_id = p.id LEFT JOIN deaneries d ON p.deanery_id = d.id LEFT JOIN dioceses o ON p.diocese_id = o.id"
+            ).fetchall()]
+            
         return {
             "dioceses": dioceses,
             "deaneries": deaneries,
@@ -1141,10 +1472,23 @@ def db_remove_member_group(member_group_id):
     return True
 
 # --- Families CRUD ---
-def db_get_families(parish_id=None):
+def db_get_families(parish_id=None, allowed_parish_ids=None):
     conn = get_db_connection()
     cursor = conn.cursor()
-    if parish_id:
+    if allowed_parish_ids is not None:
+        if not allowed_parish_ids:
+            conn.close()
+            return []
+        if parish_id:
+            if parish_id in allowed_parish_ids:
+                cursor.execute("SELECT f.*, w.name as ward_name FROM families f LEFT JOIN wards w ON f.ward_id = w.id WHERE f.parish_id = ?", (parish_id,))
+            else:
+                conn.close()
+                return []
+        else:
+            placeholders = ",".join(["?"] * len(allowed_parish_ids))
+            cursor.execute(f"SELECT f.*, w.name as ward_name FROM families f LEFT JOIN wards w ON f.ward_id = w.id WHERE f.parish_id IN ({placeholders})", allowed_parish_ids)
+    elif parish_id:
         cursor.execute("SELECT f.*, w.name as ward_name FROM families f LEFT JOIN wards w ON f.ward_id = w.id WHERE f.parish_id = ?", (parish_id,))
     else:
         cursor.execute("SELECT f.*, w.name as ward_name FROM families f LEFT JOIN wards w ON f.ward_id = w.id")
@@ -1242,3 +1586,538 @@ def db_delete_family_relation(relation_id):
     conn.commit()
     conn.close()
     return True
+
+# --- Events CRUD ---
+def db_get_events(parish_id=None, allowed_parish_ids=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    conditions = []
+    params = []
+    
+    if allowed_parish_ids is not None:
+        if not allowed_parish_ids:
+            # Can still view diocese-wide events (parish_id is NULL)
+            conditions.append("e.parish_id IS NULL")
+        else:
+            placeholders = ",".join(["?"] * len(allowed_parish_ids))
+            conditions.append(f"(e.parish_id IN ({placeholders}) OR e.parish_id IS NULL)")
+            params.extend(allowed_parish_ids)
+    elif parish_id:
+        conditions.append("(e.parish_id = ? OR e.parish_id IS NULL)")
+        params.append(parish_id)
+
+    sql = """
+        SELECT e.*, p.name as parish_name 
+        FROM events e 
+        LEFT JOIN parishes p ON e.parish_id = p.id
+    """
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY e.start_time ASC"
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def db_get_event(event_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT e.*, p.name as parish_name 
+        FROM events e 
+        LEFT JOIN parishes p ON e.parish_id = p.id
+        WHERE e.id = ?
+    """, (event_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+def db_create_event(data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO events (parish_id, diocese_id, title, description, event_type, start_time, end_time, location)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data.get("parish_id"), data.get("diocese_id"), data["title"], data.get("description", ""),
+        data.get("event_type", "Mass"), data["start_time"], data.get("end_time"), data.get("location")
+    ))
+    conn.commit()
+    e_id = cursor.lastrowid
+    conn.close()
+    return e_id
+
+def db_update_event(event_id, data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE events 
+        SET parish_id = ?, diocese_id = ?, title = ?, description = ?, event_type = ?, start_time = ?, end_time = ?, location = ?
+        WHERE id = ?
+    """, (
+        data.get("parish_id"), data.get("diocese_id"), data["title"], data.get("description", ""),
+        data.get("event_type", "Mass"), data["start_time"], data.get("end_time"), data.get("location"),
+        event_id
+    ))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_delete_event(event_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM events WHERE id = ?", (event_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- Circulars & Announcements CRUD ---
+def db_get_circulars(diocese_id=None, deanery_id=None, parish_id=None, allowed_parish_ids=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    conditions = []
+    params = []
+
+    if allowed_parish_ids is not None:
+        if not allowed_parish_ids:
+            conditions.append("(c.parish_id IS NULL AND c.deanery_id IS NULL)")
+        else:
+            placeholders = ",".join(["?"] * len(allowed_parish_ids))
+            conditions.append(f"(c.parish_id IN ({placeholders}) OR (c.parish_id IS NULL AND (c.deanery_id IS NULL OR c.deanery_id IN (SELECT deanery_id FROM parishes WHERE id IN ({placeholders})))))")
+            params.extend(allowed_parish_ids)
+            params.extend(allowed_parish_ids)
+    elif parish_id:
+        conditions.append("(c.parish_id = ? OR c.parish_id IS NULL)")
+        params.append(parish_id)
+
+    sql = """
+        SELECT c.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name
+        FROM circulars c
+        LEFT JOIN parishes p ON c.parish_id = p.id
+        LEFT JOIN deaneries d ON c.deanery_id = d.id
+        LEFT JOIN dioceses o ON c.diocese_id = o.id
+    """
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY c.publish_date DESC, c.id DESC"
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def db_get_circular(circular_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT c.*, p.name as parish_name, d.name as deanery_name, o.name as diocese_name
+        FROM circulars c
+        LEFT JOIN parishes p ON c.parish_id = p.id
+        LEFT JOIN deaneries d ON c.deanery_id = d.id
+        LEFT JOIN dioceses o ON c.diocese_id = o.id
+        WHERE c.id = ?
+    """, (circular_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+def db_create_circular(data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO circulars (diocese_id, deanery_id, parish_id, title, content, priority, author, publish_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data.get("diocese_id"), data.get("deanery_id"), data.get("parish_id"),
+        data["title"], data["content"], data.get("priority", "Normal"),
+        data.get("author", "Chancery Office"), data.get("publish_date", datetime.now().strftime("%Y-%m-%d"))
+    ))
+    conn.commit()
+    c_id = cursor.lastrowid
+    conn.close()
+    return c_id
+
+def db_delete_circular(circular_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM circulars WHERE id = ?", (circular_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- Contributions & Tithes CRUD ---
+def db_get_contributions(parish_id=None, family_id=None, member_id=None, category=None, from_date=None, to_date=None, allowed_parish_ids=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    conditions = []
+    params = []
+
+    if allowed_parish_ids is not None:
+        if not allowed_parish_ids:
+            conn.close()
+            return []
+        if parish_id:
+            if parish_id in allowed_parish_ids:
+                conditions.append("c.parish_id = ?")
+                params.append(parish_id)
+            else:
+                conn.close()
+                return []
+        else:
+            placeholders = ",".join(["?"] * len(allowed_parish_ids))
+            conditions.append(f"c.parish_id IN ({placeholders})")
+            params.extend(allowed_parish_ids)
+    elif parish_id:
+        conditions.append("c.parish_id = ?")
+        params.append(parish_id)
+
+    if family_id:
+        conditions.append("c.family_id = ?")
+        params.append(family_id)
+    if member_id:
+        conditions.append("c.member_id = ?")
+        params.append(member_id)
+    if category:
+        conditions.append("c.category = ?")
+        params.append(category)
+    if from_date:
+        conditions.append("c.payment_date >= ?")
+        params.append(from_date)
+    if to_date:
+        conditions.append("c.payment_date <= ?")
+        params.append(to_date)
+
+    sql = """
+        SELECT c.*, p.name as parish_name,
+               CONCAT(m.first_name, ' ', m.last_name) as member_name,
+               f.name as family_name
+        FROM contributions c
+        LEFT JOIN parishes p ON c.parish_id = p.id
+        LEFT JOIN members m ON c.member_id = m.id
+        LEFT JOIN families f ON c.family_id = f.id
+    """
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY c.payment_date DESC, c.id DESC"
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def db_get_contribution(contribution_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT c.*, p.name as parish_name,
+               CONCAT(m.first_name, ' ', m.last_name) as member_name,
+               f.name as family_name
+        FROM contributions c
+        LEFT JOIN parishes p ON c.parish_id = p.id
+        LEFT JOIN members m ON c.member_id = m.id
+        LEFT JOIN families f ON c.family_id = f.id
+        WHERE c.id = ?
+    """, (contribution_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+def db_create_contribution(data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    receipt_no = data.get("receipt_no")
+    if not receipt_no:
+        year = datetime.now().year
+        cursor.execute("SELECT COUNT(*) FROM contributions WHERE receipt_no LIKE ?", (f"REC-{year}-%",))
+        count = cursor.fetchone()[0] + 1
+        receipt_no = f"REC-{year}-{count:05d}"
+
+    cursor.execute("""
+        INSERT INTO contributions (
+            parish_id, family_id, member_id, category, amount, payment_method, reference_no, receipt_no, payment_date, notes, recorded_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data["parish_id"], data.get("family_id"), data.get("member_id"),
+        data["category"], float(data["amount"]), data.get("payment_method", "Cash"),
+        data.get("reference_no"), receipt_no, data.get("payment_date", datetime.now().strftime("%Y-%m-%d")),
+        data.get("notes"), data.get("recorded_by")
+    ))
+    conn.commit()
+    c_id = cursor.lastrowid
+    conn.close()
+    return c_id, receipt_no
+
+def db_delete_contribution(contribution_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM contributions WHERE id = ?", (contribution_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_get_contributions_summary(parish_id=None, allowed_parish_ids=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    conditions = []
+    params = []
+
+    if allowed_parish_ids is not None:
+        if not allowed_parish_ids:
+            conn.close()
+            return {"total_amount": 0.0, "by_category": {}, "count": 0}
+        placeholders = ",".join(["?"] * len(allowed_parish_ids))
+        conditions.append(f"parish_id IN ({placeholders})")
+        params.extend(allowed_parish_ids)
+    elif parish_id:
+        conditions.append("parish_id = ?")
+        params.append(parish_id)
+
+    where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    cursor.execute(f"SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as cnt FROM contributions{where_clause}", params)
+    row = cursor.fetchone()
+    total = float(row["total"])
+    count = int(row["cnt"])
+
+    cursor.execute(f"SELECT category, COALESCE(SUM(amount), 0) as subtotal, COUNT(*) as cnt FROM contributions{where_clause} GROUP BY category", params)
+    cat_rows = cursor.fetchall()
+    by_category = {r["category"]: {"total": float(r["subtotal"]), "count": int(r["cnt"])} for r in cat_rows}
+
+    conn.close()
+    return {
+        "total_amount": total,
+        "total_transactions": count,
+        "by_category": by_category
+    }
+
+# ==============================================================================
+# Commissions, Competitions & Programs
+# ==============================================================================
+
+def db_get_commissions():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT c.*, 
+               (SELECT COUNT(*) FROM commission_programs cp WHERE cp.commission_id = c.id) as programs_count,
+               (SELECT COUNT(*) FROM commission_programs cp WHERE cp.commission_id = c.id AND cp.type = 'Competition') as competitions_count
+        FROM commissions c 
+        ORDER BY c.order_num ASC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def db_get_commission(commission_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM commissions WHERE id = ?", (commission_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+    res = dict(row)
+    cursor.execute("""
+        SELECT cp.*, c.name as commission_name,
+               (SELECT COUNT(*) FROM program_participants pp WHERE pp.program_id = cp.id) as participants_count
+        FROM commission_programs cp 
+        JOIN commissions c ON cp.commission_id = c.id
+        WHERE cp.commission_id = ?
+        ORDER BY cp.start_date DESC
+    """, (commission_id,))
+    programs = cursor.fetchall()
+    res["programs"] = [dict(p) for p in programs]
+    conn.close()
+    return res
+
+def db_get_programs(commission_id=None, program_type=None, status=None, allowed_parish_ids=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    sql = """
+        SELECT cp.*, 
+               c.name as commission_name,
+               c.icon_name as commission_icon,
+               p.name as parish_name,
+               (SELECT COUNT(*) FROM program_participants pp WHERE pp.program_id = cp.id) as participants_count
+        FROM commission_programs cp
+        JOIN commissions c ON cp.commission_id = c.id
+        LEFT JOIN parishes p ON cp.parish_id = p.id
+        WHERE 1=1
+    """
+    params = []
+    if commission_id:
+        sql += " AND cp.commission_id = ?"
+        params.append(commission_id)
+    if program_type and program_type != "all":
+        sql += " AND cp.type = ?"
+        params.append(program_type)
+    if status and status != "all":
+        sql += " AND cp.status = ?"
+        params.append(status)
+    sql += " ORDER BY cp.start_date ASC"
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def db_get_program(program_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT cp.*, 
+               c.name as commission_name,
+               c.icon_name as commission_icon,
+               c.director_name as commission_director,
+               p.name as parish_name
+        FROM commission_programs cp
+        JOIN commissions c ON cp.commission_id = c.id
+        LEFT JOIN parishes p ON cp.parish_id = p.id
+        WHERE cp.id = ?
+    """, (program_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+    res = dict(row)
+    cursor.execute("""
+        SELECT pp.*, pr.name as parish_name
+        FROM program_participants pp
+        LEFT JOIN parishes pr ON pp.parish_id = pr.id
+        WHERE pp.program_id = ?
+        ORDER BY pp.score DESC, pp.registered_at ASC
+    """, (program_id,))
+    parts = cursor.fetchall()
+    res["participants"] = [dict(p) for p in parts]
+    conn.close()
+    return res
+
+def db_create_program(data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO commission_programs 
+        (commission_id, diocese_id, deanery_id, parish_id, title, description, type, target_audience,
+         start_date, end_date, venue, registration_deadline, eligibility, guidelines, max_participants,
+         contact_person, contact_phone, status, banner_url, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data.get("commission_id"), data.get("diocese_id"), data.get("deanery_id"), data.get("parish_id"),
+        data.get("title"), data.get("description"), data.get("type", "Program"), data.get("target_audience", "All"),
+        data.get("start_date"), data.get("end_date"), data.get("venue"), data.get("registration_deadline"),
+        data.get("eligibility"), data.get("guidelines"), data.get("max_participants"),
+        data.get("contact_person"), data.get("contact_phone"), data.get("status", "Upcoming"),
+        data.get("banner_url"), data.get("created_by")
+    ))
+    conn.commit()
+    p_id = cursor.lastrowid
+    conn.close()
+    return p_id
+
+def db_update_program(program_id, data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE commission_programs
+        SET commission_id = ?, parish_id = ?, title = ?, description = ?, type = ?, target_audience = ?,
+            start_date = ?, end_date = ?, venue = ?, registration_deadline = ?, eligibility = ?,
+            guidelines = ?, max_participants = ?, contact_person = ?, contact_phone = ?, status = ?
+        WHERE id = ?
+    """, (
+        data.get("commission_id"), data.get("parish_id"), data.get("title"), data.get("description"),
+        data.get("type"), data.get("target_audience"), data.get("start_date"), data.get("end_date"),
+        data.get("venue"), data.get("registration_deadline"), data.get("eligibility"),
+        data.get("guidelines"), data.get("max_participants"), data.get("contact_person"),
+        data.get("contact_phone"), data.get("status"), program_id
+    ))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_delete_program(program_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM commission_programs WHERE id = ?", (program_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_get_program_participants(program_id, parish_id=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    sql = """
+        SELECT pp.*, pr.name as parish_name, cp.title as program_title
+        FROM program_participants pp
+        JOIN commission_programs cp ON pp.program_id = cp.id
+        LEFT JOIN parishes pr ON pp.parish_id = pr.id
+        WHERE pp.program_id = ?
+    """
+    params = [program_id]
+    if parish_id:
+        sql += " AND pp.parish_id = ?"
+        params.append(parish_id)
+    sql += " ORDER BY pp.score DESC, pp.registered_at ASC"
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def db_get_participant(participant_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT pp.*, pr.name as parish_name, cp.title as program_title, cp.venue, cp.start_date,
+               c.name as commission_name, c.director_name as commission_director
+        FROM program_participants pp
+        JOIN commission_programs cp ON pp.program_id = cp.id
+        JOIN commissions c ON cp.commission_id = c.id
+        LEFT JOIN parishes pr ON pp.parish_id = pr.id
+        WHERE pp.id = ?
+    """, (participant_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def db_register_participant(data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO program_participants
+        (program_id, parish_id, member_id, participant_name, age, gender, contact_phone, contact_email, team_name, category, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data.get("program_id"), data.get("parish_id"), data.get("member_id"), data.get("participant_name"),
+        data.get("age"), data.get("gender"), data.get("contact_phone"), data.get("contact_email"),
+        data.get("team_name"), data.get("category", "General"), data.get("status", "Registered")
+    ))
+    conn.commit()
+    part_id = cursor.lastrowid
+    conn.close()
+    return part_id
+
+def db_update_participant(participant_id, data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE program_participants
+        SET participant_name = ?, age = ?, gender = ?, contact_phone = ?, contact_email = ?,
+            team_name = ?, category = ?, status = ?, score = ?, `rank` = ?, certificate_issued = ?
+        WHERE id = ?
+    """, (
+        data.get("participant_name"), data.get("age"), data.get("gender"), data.get("contact_phone"),
+        data.get("contact_email"), data.get("team_name"), data.get("category"), data.get("status"),
+        data.get("score"), data.get("rank"), data.get("certificate_issued", 0), participant_id
+    ))
+    conn.commit()
+    conn.close()
+    return True
+
+def db_delete_participant(participant_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM program_participants WHERE id = ?", (participant_id,))
+    conn.commit()
+    conn.close()
+    return True
+
